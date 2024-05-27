@@ -109,9 +109,9 @@ def model_defaults():
     """
     return dict(
         image_size=320,
-        model_channels=128,
+        model_channels=64,
         learn_sigma=False,
-        num_res_blocks=2,
+        num_res_blocks=(3,4,6,3),
         attention_resolutions="20",
         dropout=0,
         channel_mult="",
@@ -150,7 +150,7 @@ def create_model(
 
     if channel_mult == "":
         # 320, 160, 80, 40, 20
-        channel_mult = (1, 1, 2, 2, 4)
+        channel_mult = (1, 2, 4, 8)
     else:
         channel_mult = tuple(int(ch_mult) for ch_mult in channel_mult.split(","))
 
