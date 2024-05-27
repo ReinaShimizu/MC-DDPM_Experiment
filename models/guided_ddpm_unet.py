@@ -102,7 +102,7 @@ class Upsample(nn.Module):
             self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=1)
 
     def forward(self, x):
-        assert x.shape[1] == self.channels
+        #assert x.shape[1] == self.channels
         if self.dims == 3:
             x = F.interpolate(
                 x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
@@ -137,11 +137,11 @@ class Downsample(nn.Module):
                 dims, self.channels, self.out_channels, 3, stride=stride, padding=1
             )
         else:
-            assert self.channels == self.out_channels
+            #assert self.channels == self.out_channels
             self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
 
     def forward(self, x):
-        assert x.shape[1] == self.channels
+        #assert x.shape[1] == self.channels
         return self.op(x)
 
 
@@ -188,10 +188,9 @@ class ResBlock(TimestepBlock):
         self.use_scale_shift_norm = use_scale_shift_norm
 
         self.in_layers = nn.Sequential(
-            normalization(channels),
-            # nn.SiLU(),  # source
-            SiLU(),  # new
             conv_nd(dims, channels, self.out_channels, 3, padding=1),
+            normalization(self.out_channels),
+            nn.ReLU()  # new
         )
 
         self.updown = up or down
@@ -207,20 +206,18 @@ class ResBlock(TimestepBlock):
 
         self.emb_layers = nn.Sequential(
             # nn.SiLU(),  # source
-            SiLU(),  # new
+            nn.ReLU(),  # new
             linear(
                 emb_channels,
                 2 * self.out_channels if use_scale_shift_norm else self.out_channels,
             ),
         )
+
         self.out_layers = nn.Sequential(
-            normalization(self.out_channels),
-            # nn.SiLU(),  # source
-            SiLU(),  # new
-            nn.Dropout(p=dropout),
             zero_module(
                 conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
             ),
+            normalization(self.out_channels)
         )
 
         if self.out_channels == channels:
@@ -266,7 +263,7 @@ class ResBlock(TimestepBlock):
         else:
             h = h + emb_out
             h = self.out_layers(h)
-        return self.skip_connection(x) + h
+        return nn.ReLU()(self.skip_connection(x) + h)
 
 
 # ytxie: In this module, time t is not the input.
@@ -487,7 +484,7 @@ class UNetModel(nn.Module):
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
             # nn.SiLU(),  # source
-            SiLU(),  # new
+            nn.ReLU(),  # new
             linear(time_embed_dim, time_embed_dim),
         )
 
@@ -498,23 +495,28 @@ class UNetModel(nn.Module):
         self.input_blocks = nn.ModuleList(
             [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
         )
+        
         self._feature_size = ch
         input_block_chans = [ch]
         ds = 1
-        for level, mult in enumerate(channel_mult):
-            for _ in range(num_res_blocks):
+        for (level, (mult, n_blocks)) in enumerate(zip(channel_mult, num_res_blocks)):
+            for _ in range(n_blocks):
+                out_ch = int(mult*model_channels)
+                downsample = (ch != out_ch)
+
                 layers = [
                     ResBlock(
                         ch,
                         time_embed_dim,
                         dropout,
-                        out_channels=int(mult * model_channels),
+                        out_channels=out_ch,
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
+                        down=downsample,
                     )
                 ]
-                ch = int(mult * model_channels)
+                ch = out_ch
                 if ds in attention_resolutions:
                     layers.append(
                         AttentionBlock(
@@ -528,30 +530,7 @@ class UNetModel(nn.Module):
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
                 input_block_chans.append(ch)
-            if level != len(channel_mult) - 1:
-                out_ch = ch
-                self.input_blocks.append(
-                    TimestepEmbedSequential(
-                        ResBlock(
-                            ch,
-                            time_embed_dim,
-                            dropout,
-                            out_channels=out_ch,
-                            dims=dims,
-                            use_checkpoint=use_checkpoint,
-                            use_scale_shift_norm=use_scale_shift_norm,
-                            down=True,
-                        )
-                        if resblock_updown
-                        else Downsample(
-                            ch, conv_resample, dims=dims, out_channels=out_ch
-                        )
-                    )
-                )
-                ch = out_ch
-                input_block_chans.append(ch)
-                ds *= 2
-                self._feature_size += ch
+            ds *= 2
 
         self.middle_block = TimestepEmbedSequential(
             ResBlock(
@@ -581,21 +560,27 @@ class UNetModel(nn.Module):
         self._feature_size += ch
 
         self.output_blocks = nn.ModuleList([])
-        for level, mult in list(enumerate(channel_mult))[::-1]:
-            for i in range(num_res_blocks + 1):
+        for level, (mult, n_blocks) in enumerate(zip(reversed(channel_mult), reversed(num_res_blocks))):
+            next_level_ch = int(model_channels*mult) if level > 0 else None
+            for i in range(n_blocks):
                 ich = input_block_chans.pop()
+                upsample = (next_level_ch is not None and ch != next_level_ch)
+
                 layers = [
                     ResBlock(
-                        ch + ich,
+                        ch,
                         time_embed_dim,
                         dropout,
                         out_channels=int(model_channels * mult),
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
+                        up=upsample,
                     )
                 ]
+
                 ch = int(model_channels * mult)
+
                 if ds in attention_resolutions:
                     layers.append(
                         AttentionBlock(
@@ -606,30 +591,17 @@ class UNetModel(nn.Module):
                             use_new_attention_order=use_new_attention_order,
                         )
                     )
-                if level and i == num_res_blocks:
-                    out_ch = ch
-                    layers.append(
-                        ResBlock(
-                            ch,
-                            time_embed_dim,
-                            dropout,
-                            out_channels=out_ch,
-                            dims=dims,
-                            use_checkpoint=use_checkpoint,
-                            use_scale_shift_norm=use_scale_shift_norm,
-                            up=True,
-                        )
-                        if resblock_updown
-                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
-                    )
-                    ds //= 2
+
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
+
+            if level>0:
+                ds //= 2
 
         self.out = nn.Sequential(
             normalization(ch),
             # nn.SiLU(),  # source
-            SiLU(),  # new
+            nn.ReLU(),  # new
             zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
         )
 
@@ -676,7 +648,7 @@ class UNetModel(nn.Module):
             hs.append(h)
         h = self.middle_block(h, emb)
         for module in self.output_blocks:
-            h = th.cat([h, hs.pop()], dim=1)
+            #h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         h = h.type(x.dtype)
         return self.out(h)
@@ -753,7 +725,7 @@ class EncoderUNetModel(nn.Module):
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
             # nn.SiLU(),  # source
-            SiLU(),  # new
+            nn.ReLU(),  # new
             linear(time_embed_dim, time_embed_dim),
         )
 
@@ -847,7 +819,7 @@ class EncoderUNetModel(nn.Module):
             self.out = nn.Sequential(
                 normalization(ch),
                 # nn.SiLU(),  # source
-                SiLU(),  # new
+                nn.ReLU(),  # new
                 nn.AdaptiveAvgPool2d((1, 1)),
                 zero_module(conv_nd(dims, ch, out_channels, 1)),
                 nn.Flatten(),
@@ -857,7 +829,7 @@ class EncoderUNetModel(nn.Module):
             self.out = nn.Sequential(
                 normalization(ch),
                 # nn.SiLU(),  # source
-                SiLU(),  # new
+                nn.ReLU(),  # new
                 AttentionPool2d(
                     (image_size // ds), ch, num_head_channels, out_channels
                 ),
@@ -873,7 +845,7 @@ class EncoderUNetModel(nn.Module):
                 nn.Linear(self._feature_size, 2048),
                 normalization(2048),
                 # nn.SiLU(),  # source
-                SiLU(),  # new
+                nn.ReLU(),  # new
                 nn.Linear(2048, self.out_channels),
             )
         else:
